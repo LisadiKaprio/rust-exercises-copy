@@ -1,4 +1,4 @@
-use std::sync::mpsc::RecvError;
+use std::net::SocketAddr;
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -6,7 +6,7 @@ use tokio::{
         tcp::{ReadHalf, WriteHalf},
         TcpListener,
     },
-    sync::broadcast::{self, Receiver, Sender},
+    sync::broadcast::{self, error::RecvError, Receiver, Sender},
 };
 
 #[tokio::main]
@@ -21,9 +21,9 @@ async fn main() {
     }
 }
 
-async fn handle_client(listener: &TcpListener, tx: Sender<String>) {
+async fn handle_client(listener: &TcpListener, tx: Sender<(String, SocketAddr)>) {
     let mut rx = tx.subscribe();
-    let (mut socket, _addr) = listener.accept().await.unwrap();
+    let (mut socket, addr) = listener.accept().await.unwrap();
     println!("Client joined...");
 
     tokio::spawn(async move {
@@ -31,10 +31,18 @@ async fn handle_client(listener: &TcpListener, tx: Sender<String>) {
         let mut reader = BufReader::new(read_half);
 
         let mut line = String::new();
+        write_half.write_all(&"Welcome!".as_bytes()).await.unwrap();
 
         loop {
-            handle_communication(&mut write_half, &mut reader, &mut line, tx.clone(), &mut rx)
-                .await;
+            handle_communication(
+                &mut write_half,
+                &mut reader,
+                &mut line,
+                tx.clone(),
+                &mut rx,
+                &addr,
+            )
+            .await;
         }
     });
 }
@@ -43,31 +51,31 @@ async fn handle_communication(
     write_half: &mut WriteHalf<'_>,
     reader: &mut BufReader<ReadHalf<'_>>,
     line: &mut String,
-    tx: Sender<String>,
-    rx: &mut Receiver<String>,
+    tx: Sender<(String, SocketAddr)>,
+    rx: &mut Receiver<(String, SocketAddr)>,
+    addr: &SocketAddr,
 ) {
-    println!("cycle start!");
-
-    write_half
-        .write_all(&"Write your message here: ".as_bytes())
-        .await
-        .unwrap();
-
     tokio::select! {
         _result = reader.read_line(line) => {
-            tx.send(line.clone()).unwrap();
+            tx.send((line.clone(), addr.clone())).unwrap();
             line.clear();
         }
         result = rx.recv() => {
-            receive_message(result.unwrap(), write_half, line).await
+            receive_message(result, write_half, line, addr).await
         }
     }
-    println!("cycle end!");
 }
 
-async fn receive_message(msg: String, write_half: &mut WriteHalf<'_>, line: &mut String) {
-    let msg = format!("\r\n\r\n{}", msg);
+async fn receive_message(
+    result: Result<(String, SocketAddr), RecvError>,
+    write_half: &mut WriteHalf<'_>,
+    line: &mut String,
+    addr: &SocketAddr,
+) {
+    let (msg, other_addr) = result.unwrap();
 
-    write_half.write_all(&msg.as_bytes()).await.unwrap();
+    if addr != &other_addr {
+        write_half.write_all(&msg.as_bytes()).await.unwrap();
+    }
     line.clear();
 }
