@@ -1,12 +1,17 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     future::Future,
+    sync::Arc,
 };
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream, ToSocketAddrs},
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    signal::ctrl_c,
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        Notify,
+    },
     task::JoinHandle,
 };
 
@@ -23,6 +28,9 @@ where
     })
 }
 
+// start by cargo run
+// then connect from different terminal instances using `telnet localhost 8080`
+
 // NOTE:    the code from the book implemented here
 //          assumes that you write messages formatted like this:
 //          "other_user_1, other_user_2: Hello world!"
@@ -33,16 +41,44 @@ pub(crate) async fn main() -> BoxedResult<()> {
 }
 
 async fn accept_loop(addr: impl ToSocketAddrs) -> BoxedResult<()> {
+    // starting server at localhost port 8080
     let listener = TcpListener::bind(addr).await?;
     println!("Connected to {}", listener.local_addr()?.to_string());
 
+    // creating a channel that can send and receive signals
     let (broker_sender, broker_receiver) = unbounded_channel();
-    let _broker = tokio::spawn(broker_loop(broker_receiver));
 
-    while let Ok((stream, _addr)) = listener.accept().await {
-        println!("Client joined...");
-        spawn_and_log_error(handle_client_communication(broker_sender.clone(), stream));
+    // creating an async loop that receives messages
+    let broker = tokio::spawn(broker_loop(broker_receiver));
+
+    // declaring empty notification that can be cloned asynchronously to many processes when needed
+    let shutdown_notifaction = Arc::new(Notify::new());
+
+    loop {
+        // each iteration, we watch out for either clients joining on server listener,
+        // or for shutdown initiated by user getting detected
+        tokio::select! {
+            Ok((stream, _addr)) = listener.accept() => {
+                println!("Client joined...");
+
+                // start loop that will handle this client's communication (by creating another send-receive channel)
+                spawn_and_log_error(handle_client_communication(broker_sender.clone(), stream, shutdown_notifaction.clone()));
+            },
+            _ = ctrl_c() => break,
+        }
     }
+    // we only arrive here if user shut down the server
+    println!("Shutting down server...");
+
+    // we use the notification to notify all awaiting still running processes about the shutdown?
+    shutdown_notifaction.notify_waiters();
+
+    // we get rid of the broker part that sends signals to clients
+    // that way, the broker loop will end once all tasks are done, since no more messages can be sent?
+    drop(broker_sender);
+
+    // we wait for broker to finish what it was doing
+    broker.await?;
     Ok(())
 }
 enum Event {
@@ -100,6 +136,18 @@ async fn broker_loop(mut events: UnboundedReceiver<Event>) {
             }
         }
     }
+    for client in &clients {
+        let sending_attempt = client
+            .1
+            .send("Admin is shutting down the server...".to_string());
+        if let Err(e) = sending_attempt {
+            eprintln!(
+                "Error while sending shutdown message on {:?}: {e}",
+                &client.0
+            );
+        }
+    }
+    drop(clients);
 }
 
 async fn receive_messages_on_loop(
@@ -119,6 +167,7 @@ async fn receive_messages_on_loop(
 async fn handle_client_communication(
     broker_sender: UnboundedSender<Event>,
     stream: TcpStream,
+    shutdown_notification: Arc<Notify>,
 ) -> BoxedResult<()> {
     let (read_half, mut write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
@@ -143,28 +192,29 @@ async fn handle_client_communication(
         .unwrap();
 
     loop {
-        if let Some(line) = lines.next_line().await? {
-            println!("{:?}", &line);
-            let (dest, message) = match line.find(':') {
-                None => continue,
-                Some(idx) => (&line[..idx], line[idx + 1..].trim()),
-            };
-            let dest: Vec<String> = dest
-                .split(',')
-                .map(|name| name.trim().to_string())
-                .collect();
-            let message = message.trim().to_string();
+        tokio::select! {
+            Ok(Some(line)) = lines.next_line() => {
+                println!("{:?}", &line);
+                let (dest, message) = match line.find(':') {
+                    None => continue,
+                    Some(idx) => (&line[..idx], line[idx + 1..].trim()),
+                };
+                let dest: Vec<String> = dest
+                    .split(',')
+                    .map(|name| name.trim().to_string())
+                    .collect();
+                let message = message.trim().to_string();
 
-            // deliberate unwrap() for broker actions, as mentioned in book
-            broker_sender
-                .send(Event::Message {
-                    from_name: name.clone(),
-                    to_names: dest,
-                    message,
-                })
-                .unwrap();
-        } else {
-            break;
+                // deliberate unwrap() for broker actions, as mentioned in book
+                broker_sender
+                    .send(Event::Message {
+                        from_name: name.clone(),
+                        to_names: dest,
+                        message,
+                    })
+                    .unwrap();
+            },
+            _ = shutdown_notification.notified() => break,
         }
     }
     Ok(())
