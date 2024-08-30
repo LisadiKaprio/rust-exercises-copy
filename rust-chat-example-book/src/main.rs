@@ -1,7 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     future::Future,
-    net::SocketAddr,
 };
 
 use tokio::{
@@ -40,9 +39,9 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> BoxedResult<()> {
     let (broker_sender, broker_receiver) = unbounded_channel();
     let _broker = tokio::spawn(broker_loop(broker_receiver));
 
-    while let Ok((stream, addr)) = listener.accept().await {
+    while let Ok((stream, _addr)) = listener.accept().await {
         println!("Client joined...");
-        spawn_and_log_error(connection_loop(broker_sender.clone(), stream));
+        spawn_and_log_error(handle_client_communication(broker_sender.clone(), stream));
     }
     Ok(())
 }
@@ -52,9 +51,9 @@ enum Event {
         write_half: OwnedWriteHalf,
     },
     Message {
-        from: String,
-        to: Vec<String>,
-        msg: String,
+        from_name: String,
+        to_names: Vec<String>,
+        message: String,
     },
 }
 
@@ -81,7 +80,11 @@ async fn broker_loop(mut events: UnboundedReceiver<Event>) {
                     });
                 }
             },
-            Event::Message { from, to, msg } => {
+            Event::Message {
+                from_name: from,
+                to_names: to,
+                message: msg,
+            } => {
                 for addr in to {
                     if let Some(client) = clients.get(&addr) {
                         let message = format!("{:?}: {:?}\n", from, &msg);
@@ -113,20 +116,7 @@ async fn receive_messages_on_loop(
     Ok(())
 }
 
-async fn connection_loop(
-    broker_sender: UnboundedSender<Event>,
-    stream: TcpStream,
-) -> BoxedResult<()> {
-    tokio::spawn(async move {
-        let communication = handle_communication(broker_sender.clone(), stream).await;
-        if let Err(e) = communication {
-            eprintln!("Error on handling communication: {e}");
-        }
-    });
-    Ok(())
-}
-
-async fn handle_communication(
+async fn handle_client_communication(
     broker_sender: UnboundedSender<Event>,
     stream: TcpStream,
 ) -> BoxedResult<()> {
@@ -168,9 +158,9 @@ async fn handle_communication(
             // deliberate unwrap() for broker actions, as mentioned in book
             broker_sender
                 .send(Event::Message {
-                    from: name.clone(),
-                    to: dest,
-                    msg: message,
+                    from_name: name.clone(),
+                    to_names: dest,
+                    message,
                 })
                 .unwrap();
         } else {
@@ -179,16 +169,3 @@ async fn handle_communication(
     }
     Ok(())
 }
-
-// async fn receive_message(
-//     result: Result<(String, SocketAddr), RecvError>,
-//     write_half: &mut WriteHalf<'_>,
-//     addr: &SocketAddr,
-// ) -> BoxedResult<()> {
-//     let (msg, other_addr) = result.unwrap();
-
-//     if addr != &other_addr {
-//         write_half.write_all(&msg.as_bytes()).await?;
-//     }
-//     Ok(())
-// }
