@@ -4,4 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.86"
+async-trait = "0.1.82"
+russh = "0.45.0"
+russh-keys = "0.45.0"
 tokio = { version = "1", features = ["full"]}
+
+
+[[bin]]
+name = "ssh_driver"
+path = "src/ssh_driver.rs"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
