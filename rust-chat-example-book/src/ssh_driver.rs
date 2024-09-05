@@ -1,83 +1,82 @@
 use async_trait::async_trait;
-use russh::{client, CryptoVec};
+use dotenv::dotenv;
+use russh::{
+    client::{self, Session},
+    ChannelId,
+};
 use russh_keys::{key, load_secret_key};
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
-use tokio::io::{stdin, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::{env, sync::Arc};
+use tokio::io::{stdin, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod utils;
 use utils::BoxedResult;
 
 #[tokio::main]
 pub(crate) async fn main() -> BoxedResult<()> {
-    start_ssh_driver(
-        "WegesrandUser".to_string(),
-        r"C:\Users\WegesrandUser\.ssh\id_rsa".to_string(),
-        "run".to_string(),
-    )
-    .await
+    dotenv().ok();
+    let client_user = env::var("CLIENT_USER").expect("CLIENT_USER must be named in env file.");
+    let client_private_ssh_key_location = env::var("CLIENT_PRIVATE_SSH_KEY").unwrap();
+
+    let host =
+        env::var("SERVER_HOST").expect("SERVER_HOST must be named in env file (f.e. 0.0.0.0).");
+    let port = env::var("SERVER_PORT").expect("SERVER_PORT must be named in env file (f.e. 2222).");
+    let port = port
+        .parse::<u16>()
+        .expect("SERVER_PORT must be a valid number.");
+
+    start_ssh_driver(client_user, client_private_ssh_key_location, host, port).await
 }
 
-// Starts the ssh bridge driver
+// Read data from server ->     go to Client implementation -> data()
+// Send data to server ->       go to tokio::spawn -> reader.read_line match -> stream.write_all
+
+// 1. Running client, client gets saved with its unique id
+// 2. User types command "/connect 3"
+// 3. Server interprets the message as command and saves a connection to client with id 3
+//      ->  only if client with id 3 isn't already connected,
+//          otherwise user receives "Cannot connect to 3 at the moment" from server
+// 4. User types message
+// 5. Server receives message, checks that user's client is already connected to client 3
+// 6. Client 3 receives the message.
+
+// type command "/clients" and see a list of available client ids
+
 pub async fn start_ssh_driver(
     user: String,
-    private_key_path: String,
-    run_command: String,
+    private_key: String,
+    host: String,
+    port: u16,
 ) -> Result<(), anyhow::Error> {
-    // Open SSH Session
-    let key_pair = load_secret_key(private_key_path, None)?;
+    let key_pair = load_secret_key(private_key, None)?;
 
     let config = client::Config { ..<_>::default() };
     let config = Arc::new(config);
     let sh = Client {};
-    let mut session = client::connect(config, ("localhost", 2222), sh).await?;
+    let mut session = client::connect(config, (host, port), sh).await?;
 
     let _auth_res = session
         .authenticate_publickey(user, Arc::new(key_pair))
         .await?;
 
-    // Create new channel
     let channel = session.channel_open_session().await.unwrap();
-    println!("channel id on client is {}", channel.id());
 
-    let _ = channel
-        .signal(russh::Sig::Custom("Hello from client!".to_string()))
-        .await;
+    // let _ = channel
+    //     .data("Hello from client!".to_string().as_bytes())
+    //     .await;
 
     let mut stream = channel.into_stream();
-
-    // First Command
-    let mut first_com = run_command;
-    first_com.push_str("\n");
-    stream.write_all(&first_com.as_bytes()).await.unwrap();
-
-    // Start async stuff
     let stdin = stdin();
     let mut reader = BufReader::new(stdin);
 
     let mut line_in = String::new();
-    let mut line_out = String::new();
-
-    // session.data(1, CryptoVec::from("hello from client!\n".to_string()));
 
     match tokio::spawn(async move {
         loop {
-            tokio::select! {
-                res = stream.read_to_string(&mut line_out) => {
-                    match res {
-                        Err(_) => break,
-                        _ => {
-                            println!("{}", &line_out);
-                            stream.write_all(&line_out.as_bytes()).await;
-                        },
-                    }
-                },
-                res = reader.read_line(&mut line_in) => {
-                    match res {
-                        Err(_) => break,
-                        _ => {
-                            stream.write_all(&line_in.as_bytes()).await.unwrap();
-                        },
-                    }
+            match reader.read_line(&mut line_in).await {
+                Err(_) => break,
+                _ => {
+                    stream.write_all(&line_in.as_bytes()).await.unwrap();
+                    line_in = String::new();
                 }
             }
         }
@@ -87,34 +86,6 @@ pub async fn start_ssh_driver(
     {
         _ => {}
     }
-
-    // ----
-    // let mut channel: Arc<Channel<Msg>> =
-    //     Arc::new(self.session.channel_open_session().await.unwrap());
-    // channel.exec(false, command).await?;
-
-    // let mut in_stream: ReceiverStream<Vec<u8>> = ReceiverStream::new(stdin);
-    // tokio::spawn(async move {
-    //     while let Some(item) = in_stream.next().await {
-    //         match str::from_utf8(&item) {
-    //             Ok(v) => channel.exec(false, v).await.unwrap(),
-    //             Err(_) => { /* Not handled :) */ }
-    //         };
-    //     }
-    // });
-
-    // while let Some(msg) = channel.wait().await {
-    //     match msg {
-    //         russh::ChannelMsg::Data { ref data } => {
-    //             let output = Vec::new();
-    //             output.write_all(data).unwrap();
-    //             self.stdout.send(output).await.unwrap();
-    //         }
-    //         _ => {}
-    //     }
-    // }
-    // Ok(())
-    // ---
     return Ok(());
 }
 
@@ -129,5 +100,17 @@ impl client::Handler for Client {
         _server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let string = String::from_utf8_lossy(data);
+        let string = string.trim().to_string();
+        println!("{string}");
+        Ok(())
     }
 }

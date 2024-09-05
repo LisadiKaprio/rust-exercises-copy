@@ -33,4 +33,5 @@ let y = &x; // y is a reference set to the address to x
 let z = *y; // z is the thing pointed to by y, so same as z = 5
 ``` 
 
+- [How to debug Rust like a PRO](https://www.youtube.com/watch?v=ebNMJ5rKRLU)
 

@@ -1,19 +1,14 @@
-use std::collections::HashMap;
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-
 use async_trait::async_trait;
 use russh::keys::*;
 use russh::server::{Msg, Server as _, Session};
 use russh::*;
 use server::Config;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
-use crate::utils::{spawn_and_log_error, BoxedResult};
+use crate::utils::BoxedResult;
 
 pub async fn start_russh_server(addr: impl ToSocketAddrs) -> BoxedResult<()> {
     let mut sh = Server {
@@ -46,12 +41,11 @@ impl Server {
         Ok(())
     }
 
-    async fn post(&mut self, data: CryptoVec) {
-        let mut clients = self.clients.lock().await;
-        for ((id, channel), ref mut s) in clients.iter_mut() {
-            if *id != self.id {
-                let _ = s.data(*channel, data.clone()).await;
-            }
+    async fn post(&mut self, receiver_id: usize, data: CryptoVec) {
+        let clients = self.clients.lock().await;
+        let receiver_client = clients.iter().find(|((id, _), _)| id == &receiver_id);
+        if let Some(((_, channel), s)) = receiver_client {
+            let _ = s.data(*channel, data).await;
         }
     }
 }
@@ -61,7 +55,7 @@ impl server::Server for Server {
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
         let s = self.clone();
         self.id += 1;
-        println!("Client joined...");
+        println!("Client joined. New client receives the id {}", { s.id });
         s
     }
 }
@@ -70,123 +64,24 @@ impl server::Server for Server {
 impl server::Handler for Server {
     type Error = anyhow::Error;
 
-    async fn signal(
-        &mut self,
-        channel: ChannelId,
-        signal: Sig,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        if let Sig::Custom(string) = signal {
-            println!("{string} from channel id {channel}");
-        }
-        Ok(())
-    }
-
-    async fn channel_open_confirmation(
-        &mut self,
-        id: ChannelId,
-        _max_packet_size: u32,
-        _window_size: u32,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        let session_handle = Arc::new(Mutex::new(session.handle()));
-        let _ = session_handle
-            .clone()
-            .lock()
-            .await
-            .data(id, CryptoVec::from("channel_open_session!\n".to_string()))
-            .await;
-        tokio::spawn(async move {
-            loop {
-                let _ = sleep(Duration::from_secs(2));
-                println!("2 seconds passed.");
-                let data = CryptoVec::from("hello from the server every 2 seconds!\n".to_string());
-                let _ = session_handle.clone().lock().await.data(id, data).await;
-            }
-        });
-        Ok(())
-    }
-
     async fn channel_open_session(
         &mut self,
-        mut channel: Channel<Msg>,
+        channel: Channel<Msg>,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let mut clients = self.clients.lock().await;
-        clients.insert((self.id, channel.id()), session.handle());
-
-        // let session_handle = Arc::new(Mutex::new(session.handle()));
         let channel_id = channel.id().to_owned();
 
-        println!("joined channel id: {}", &channel_id);
+        clients.insert((self.id, channel_id), session.handle());
 
-        //     tokio::spawn(async move {
-        //         loop {
-        //             // stream.read_to_string(&mut received_string);
+        let _ = session
+            .handle()
+            .data(
+                channel_id,
+                CryptoVec::from("The connection to the server was established!\r\n".to_string()),
+            )
+            .await;
 
-        //             // println!("stream: {}", received_string);
-
-        //             match channel.wait().await {
-        //                 Some(ChannelMsg::Data { data }) => {
-        //                     let _ = session_handle
-        //                         .clone()
-        //                         .lock()
-        //                         .await
-        //                         .data(channel_id, data)
-        //                         .await;
-        //                 }
-        //                 Some(result) => {
-        //                     println!("Result: {:?}", result);
-        //                     let _ = session_handle
-        //                         .clone()
-        //                         .lock()
-        //                         .await
-        //                         .data(channel_id, CryptoVec::from("hello!\n".to_string()))
-        //                         .await;
-        //                 }
-        //                 None => {
-        //                     println!("Channel closed");
-        //                     return;
-        //                 }
-        //             }
-        //         }
-        //     });
-        // }
-
-        // tokio::spawn(async move {
-        //     let mut buffer = String::new();
-        //     let mut stream = channel.into_stream();
-        //     stream.write_all("hi!".as_bytes()).await.unwrap();
-        //     loop {
-        //         tokio::select! {
-        //             result = stream.read_to_string(&mut buffer) => {
-        //                 match result {
-        //                     Ok(0) => break, // client closed connection
-        //                     Ok(_n) => {
-        //                         println!("received from client: {}", buffer);
-
-        //                         let response = format!("got your input: {}\n", buffer);
-        //                         stream.write_all(response.as_bytes()).await.unwrap();
-        //                     },
-        //                     Err(e) => {
-        //                         eprintln!("error reading from channel: {:?}", e);
-        //                         break;
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // });
-
-        // session_handle.data(
-        //     channel.id(),
-        //     CryptoVec::from("channel_open_session".to_string()),
-        // );
-
-        // io::stdin().read_line(buf);
-
-        // let mut stream = channel.into_stream();
-        // let mut received_string = String::new();
         Ok(true)
     }
 
@@ -205,17 +100,76 @@ impl server::Handler for Server {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        match data {
-            // Pressing 'q' closes the connection.
-            b"q" => {
+        // TODO: on receiver client, display which sender client the message came from
+
+        // TODO: create separate functions for what happens in the match statement
+        // TODO: create function that takes in receiver_channel_id and message_string and sends the message
+
+        // TODO: create enum for the commands
+        // TODO: create enum for messages that the client may receive on unexpected input
+        //              f.e. empty input, no command, no receiver id argument, no message
+
+        // TODO: clean disconnect on ctrl + c in server terminal
+        //          -> clients should receive a notification about it
+        //          -> potentially, clients should also be shut down
+        // TODO: clean disconnect on ctrl + c in client terminals
+        //          -> server should receive feedback about it and delete this client from its memory
+
+        // TODO: ensure the server app can be run on any server + port
+        //          -> (env file? command arguments when starting up?)
+        // TODO: ensure the client app can customize server + port and ssh key location?
+
+        let string = String::from_utf8_lossy(data);
+        let string = string.trim();
+
+        let split_input = string.split(' ');
+        let input_words: Vec<&str> = split_input.collect();
+
+        if input_words.len() == 0 {
+            println!("Empty input from client id {}", &self.id);
+            return Ok(());
+        }
+
+        match input_words[0] {
+            "/message" => {
+                if input_words.len() < 2 {
+                    let _ = session
+                        .handle()
+                        .data(
+                            channel,
+                            CryptoVec::from(
+                                "Input must include the receiver id, then message".to_string(),
+                            ),
+                        )
+                        .await;
+                    return Ok(());
+                }
+                let first_argument = &input_words[1];
+                if let Ok(receiver_id) = first_argument.parse::<usize>() {
+                    let message = input_words[2..].join(" ");
+                    let _ = self.post(receiver_id, CryptoVec::from(message)).await;
+                }
+            }
+            "/clients" => {
+                let clients = self.clients.lock().await;
+                let channel_ids: Vec<String> =
+                    clients.keys().map(|(id, _)| id.to_string()).collect();
+                let data = format!(
+                    "\r\r\nFollowing client ids are available to be connected to: {}\r\n",
+                    channel_ids.join(", ")
+                );
+                let data = format!("{data}Your client id is {}\r\r\n", self.id);
+
+                let _ = session.handle().data(channel, CryptoVec::from(data)).await;
+            }
+            "/quit" => {
+                // messages sent to client here cannot be received on client :/
+
                 self.clients.lock().await.remove(&(self.id, channel));
                 session.close(channel);
             }
             _ => {}
         }
-
-        let data = CryptoVec::from(format!("Got data: {}\r\n", String::from_utf8_lossy(data)));
-        self.post(data.clone()).await;
 
         Ok(())
     }
