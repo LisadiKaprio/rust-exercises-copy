@@ -4,6 +4,10 @@ use russh::server::{Msg, Server as _, Session};
 use russh::*;
 use server::Config;
 use std::collections::HashMap;
+use std::env;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::Mutex;
@@ -14,16 +18,49 @@ pub async fn start_russh_server(addr: impl ToSocketAddrs) -> BoxedResult<()> {
     let mut sh = Server {
         clients: Arc::new(Mutex::new(HashMap::new())),
         id: 0,
+        client_connections: Arc::new(Mutex::new(HashMap::new())),
     };
     let listener = TcpListener::bind(addr).await?;
     sh.connect(listener).await?;
     Ok(())
 }
 
+pub fn check_public_key<P: AsRef<Path>>(
+    path: P,
+    client_public_key: &key::PublicKey,
+) -> Result<bool, russh_keys::Error> {
+    let mut data = String::new();
+    let mut file = File::open(path.as_ref())?;
+    file.read_to_string(&mut data)?;
+
+    let mut split = data.split("\n");
+
+    while let Some(key_line) = split.next() {
+        let mut key_line = key_line.split_whitespace();
+        match (key_line.next(), key_line.next()) {
+            (Some(_), Some(key)) => {
+                let key = parse_public_key_base64(key)?;
+                if &key == client_public_key {
+                    return Ok(true);
+                }
+            }
+            (Some(key), None) => {
+                let key = parse_public_key_base64(key)?;
+                if &key == client_public_key {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Clone)]
 struct Server {
     clients: Arc<Mutex<HashMap<(usize, ChannelId), russh::server::Handle>>>,
     id: usize,
+    client_connections: Arc<Mutex<HashMap<usize, usize>>>,
 }
 
 impl Server {
@@ -63,7 +100,6 @@ impl server::Server for Server {
 #[async_trait]
 impl server::Handler for Server {
     type Error = anyhow::Error;
-
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
@@ -85,14 +121,37 @@ impl server::Handler for Server {
         Ok(true)
     }
 
+    async fn auth_publickey_offered(
+        &mut self,
+        _: &str,
+        client_public_key: &key::PublicKey,
+    ) -> Result<server::Auth, Self::Error> {
+        let client_public_ssh_key_location =
+            env::var("CLIENT_PUBLIC_SSH_KEY").expect("SERVER_PORT must be a valid number.");
+
+        // let key_pair = load_public_key(client_public_ssh_key_location)?;
+
+        if check_public_key(client_public_ssh_key_location, client_public_key)? {
+            Ok(server::Auth::Accept)
+        } else {
+            eprintln!("Could not authenticate this client's key.");
+            Err(russh::Error::NotAuthenticated.into())
+        }
+    }
+
     async fn auth_publickey(
         &mut self,
         _: &str,
         _: &key::PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        println!("New client authorized!");
+        // println!(
+        //     "New client authorized! {}",
+        //     String::from_utf16_lossy(&key.public_key_bytes())
+        // );
         Ok(server::Auth::Accept)
     }
+
+    // N9��;b▬‼��↓☻L�]9�茾�M�aox+dң��ʘ�↔-ǜ?��Q��☺�r�3�§3�c_����Vm♀�s§u�#��꙱♂���M�Weh��� ���u0}�☺2����O;[C�↕=xU♫���+�B��OIn"]O.◄�vW�d�↔¶���hO�\��$�2Р�)5tS�+��s↨�M[☺;H��▬♫n▼�S�→O��▲��T�↨*�>8d��,9�A&|��\�^��▼䶎D*�X↓ɜ[�����‼`{~-����xQ��TkGC���♣�o��♦�e�8S���►򿭑�% ‼&☻N1u♀Y↓7+�Z�N��y7��4�U�h�-�"8{h8�ӌ����Q��[�
 
     async fn data(
         &mut self,
@@ -115,10 +174,6 @@ impl server::Handler for Server {
         // TODO: clean disconnect on ctrl + c in client terminals
         //          -> server should receive feedback about it and delete this client from its memory
 
-        // TODO: ensure the server app can be run on any server + port
-        //          -> (env file? command arguments when starting up?)
-        // TODO: ensure the client app can customize server + port and ssh key location?
-
         let string = String::from_utf8_lossy(data);
         let string = string.trim();
 
@@ -129,6 +184,9 @@ impl server::Handler for Server {
             println!("Empty input from client id {}", &self.id);
             return Ok(());
         }
+
+        // TODO:    get saved client connections
+        // let mut client_connections = self.client_connections.lock().await;
 
         match input_words[0] {
             "/message" => {
@@ -144,6 +202,7 @@ impl server::Handler for Server {
                         .await;
                     return Ok(());
                 }
+
                 let first_argument = &input_words[1];
                 if let Ok(receiver_id) = first_argument.parse::<usize>() {
                     let message = input_words[2..].join(" ");
@@ -168,7 +227,16 @@ impl server::Handler for Server {
                 self.clients.lock().await.remove(&(self.id, channel));
                 session.close(channel);
             }
-            _ => {}
+            _ => {
+                // TODO: if no command was given, send message to last communicated to client
+
+                // let current_client_connection =
+                //     client_connections.iter().find(|(id, _)| id == &self.id);
+                // if let Some((_, receiver_id)) = receiver_client {
+                //     let message = input_words[0..].join(" ");
+                //     let _ = self.post(receiver_id, CryptoVec::from(message)).await;
+                // }
+            }
         }
 
         Ok(())
